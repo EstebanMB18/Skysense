@@ -1,0 +1,134 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [skysense-internal]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [skysense-internal]
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    environment:
+      MQTT_USERNAME: ${MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        mosquitto_passwd -b -c /mosquitto/data/password_file "$${MQTT_USERNAME}" "$${MQTT_PASSWORD}"
+        chown mosquitto:mosquitto /mosquitto/data/password_file
+        chmod 600 /mosquitto/data/password_file
+        exec /usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf
+    ports:
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - ./mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquittodata:/mosquitto/data
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [skysense-internal]
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      ENV: ${ENV:-production}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_REQUIRED: "true"
+      JWT_SECRET: ${JWT_SECRET}
+      ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES:-15}
+      REFRESH_TOKEN_DAYS: ${REFRESH_TOKEN_DAYS:-7}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
+      INGEST_API_KEY: ${INGEST_API_KEY}
+      MQTT_USERNAME: ${MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      OTP_TTL_SECONDS: ${OTP_TTL_SECONDS:-600}
+      OTP_MAX_ATTEMPTS: ${OTP_MAX_ATTEMPTS:-5}
+      OTP_COOLDOWN_SECONDS: ${OTP_COOLDOWN_SECONDS:-60}
+      OTP_DELIVERY_MODE: ${OTP_DELIVERY_MODE:-console}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      SES_FROM_EMAIL: ${SES_FROM_EMAIL:-no-reply@example.com}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      SEED_DEMO_USERS: ${SEED_DEMO_USERS:-true}
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/system/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [skysense-internal]
+
+  mqtt-worker:
+    build: ./backend
+    restart: unless-stopped
+    command: ["python", "-m", "app.services.mqtt_worker"]
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      MQTT_USERNAME: ${MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      MQTT_TOPIC_ROOT: ${MQTT_TOPIC_ROOT:-skysense}
+      API_BASE: http://backend:8000/api/v1
+      INGEST_API_KEY: ${INGEST_API_KEY}
+    depends_on:
+      backend:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    networks: [skysense-internal]
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api/v1
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [skysense-internal]
+
+networks:
+  skysense-internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  mosquittodata:
